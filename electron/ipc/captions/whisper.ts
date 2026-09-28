@@ -1,11 +1,10 @@
 import { createWriteStream } from "node:fs";
 import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
-import { Readable } from "node:stream";
+import type { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import type { ReadableStream as NodeReadableStream } from "node:stream/web";
 import type Electron from "electron";
-import { session } from "electron";
+import { net, session } from "electron";
 import {
 	WHISPER_MODEL_DIR,
 	WHISPER_MODEL_DOWNLOAD_URL,
@@ -51,29 +50,60 @@ const PROXY_ENV_KEYS = [
 	"all_proxy",
 ];
 
-/** Reads the proxy the user configured through the usual environment variables. */
-export function getProxyConfigFromEnv(
+type ProxyCredentials = { username: string; password: string };
+
+function firstNonEmpty(values: Array<string | undefined>) {
+	return values.map((value) => value?.trim()).find(Boolean);
+}
+
+/**
+ * Reads the proxy the user configured through the usual environment variables.
+ * Chromium proxy rules cannot carry a username and password, so credentials in
+ * the proxy URL are split off and used to answer the proxy's login challenge.
+ */
+export function getProxyFromEnv(
 	env: NodeJS.ProcessEnv = process.env,
-): Electron.ProxyConfig | null {
-	const proxyRules = PROXY_ENV_KEYS.map((key) => env[key]?.trim()).find(Boolean);
-	if (!proxyRules) {
+): { config: Electron.ProxyConfig; credentials: ProxyCredentials | null } | null {
+	const proxy = firstNonEmpty(PROXY_ENV_KEYS.map((key) => env[key]));
+	if (!proxy) {
 		return null;
 	}
 
-	const proxyBypassRules = (env.NO_PROXY ?? env.no_proxy)?.trim();
-	return proxyBypassRules ? { proxyRules, proxyBypassRules } : { proxyRules };
+	let proxyRules = proxy;
+	let credentials: ProxyCredentials | null = null;
+	if (proxy.includes("@")) {
+		try {
+			const proxyUrl = new URL(proxy.includes("://") ? proxy : `http://${proxy}`);
+			if (proxyUrl.username) {
+				credentials = {
+					username: decodeURIComponent(proxyUrl.username),
+					password: decodeURIComponent(proxyUrl.password),
+				};
+				proxyRules = `${proxyUrl.protocol}//${proxyUrl.host}`;
+			}
+		} catch {
+			// Not a URL; pass it through unchanged and let Chromium reject it.
+		}
+	}
+
+	const proxyBypassRules = firstNonEmpty([env.NO_PROXY, env.no_proxy]);
+	return {
+		config: proxyBypassRules ? { proxyRules, proxyBypassRules } : { proxyRules },
+		credentials,
+	};
 }
 
 // Electron's network stack follows the system proxy settings (unlike node:https).
 // A proxy set through environment variables wins, as it does for curl and wget.
-async function getDownloadSession(): Promise<Electron.Session> {
-	const proxyConfig = getProxyConfigFromEnv();
-	if (!proxyConfig) {
+async function getDownloadSession(
+	envProxy: ReturnType<typeof getProxyFromEnv>,
+): Promise<Electron.Session> {
+	if (!envProxy) {
 		return session.defaultSession;
 	}
 
 	const downloadSession = session.fromPartition("recordly-downloads");
-	await downloadSession.setProxy(proxyConfig);
+	await downloadSession.setProxy(envProxy.config);
 	return downloadSession;
 }
 
@@ -82,61 +112,101 @@ export async function downloadFileWithProgress(
 	destinationPath: string,
 	onProgress: (progress: number) => void,
 ): Promise<void> {
-	const downloadSession = await getDownloadSession();
-	const controller = new AbortController();
-	let timedOut = false;
-	let idleTimer: NodeJS.Timeout | undefined;
-	const resetIdleTimer = () => {
-		clearTimeout(idleTimer);
-		idleTimer = setTimeout(() => {
-			timedOut = true;
-			controller.abort();
-		}, DOWNLOAD_IDLE_TIMEOUT_MS);
-	};
+	const envProxy = getProxyFromEnv();
+	const downloadSession = await getDownloadSession(envProxy);
+	const proxyCredentials = envProxy?.credentials ?? null;
 
-	resetIdleTimer();
-	try {
-		const response = await downloadSession.fetch(url, { signal: controller.signal });
-		if (!response.ok || !response.body) {
-			throw new Error(`Whisper model download failed with status ${response.status}.`);
-		}
+	await new Promise<void>((resolve, reject) => {
+		// net.request (unlike session.fetch) emits "login" for proxy auth challenges.
+		const request = net.request({ url, session: downloadSession });
+		let response: Readable | null = null;
+		let idleTimer: NodeJS.Timeout | undefined;
+		let settled = false;
 
-		const totalBytes = Number.parseInt(response.headers.get("content-length") ?? "0", 10);
-		let downloadedBytes = 0;
-		let lastProgress = -1;
+		const finish = (error?: Error) => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			clearTimeout(idleTimer);
+			if (error) {
+				request.abort();
+				response?.destroy();
+				reject(error);
+			} else {
+				resolve();
+			}
+		};
+		const resetIdleTimer = () => {
+			clearTimeout(idleTimer);
+			idleTimer = setTimeout(
+				() => finish(new Error("Whisper model download timed out.")),
+				DOWNLOAD_IDLE_TIMEOUT_MS,
+			);
+		};
 
-		await pipeline(
-			Readable.fromWeb(response.body as NodeReadableStream<Uint8Array>),
-			async function* (chunks: AsyncIterable<Buffer>) {
-				for await (const chunk of chunks) {
-					resetIdleTimer();
-					downloadedBytes += chunk.length;
-					if (Number.isFinite(totalBytes) && totalBytes > 0) {
-						const progress = Math.min(
-							100,
-							Math.round((downloadedBytes / totalBytes) * 100),
-						);
-						if (progress !== lastProgress) {
-							lastProgress = progress;
-							onProgress(progress);
+		let sentProxyCredentials = false;
+		request.on("login", (authInfo, callback) => {
+			// Answer once: a repeated challenge means the credentials were rejected.
+			if (authInfo.isProxy && proxyCredentials && !sentProxyCredentials) {
+				sentProxyCredentials = true;
+				callback(proxyCredentials.username, proxyCredentials.password);
+			} else {
+				callback();
+			}
+		});
+		request.on("error", (error) => finish(error));
+		request.on("response", (incoming) => {
+			if (incoming.statusCode < 200 || incoming.statusCode >= 300) {
+				finish(
+					new Error(`Whisper model download failed with status ${incoming.statusCode}.`),
+				);
+				return;
+			}
+
+			// IncomingMessage is a Readable at runtime but is typed as an EventEmitter.
+			response = incoming as unknown as Readable;
+			const totalBytes = Number.parseInt(
+				String(incoming.headers["content-length"] ?? "0"),
+				10,
+			);
+			let downloadedBytes = 0;
+			let lastProgress = -1;
+
+			pipeline(
+				response,
+				async function* (chunks: AsyncIterable<Buffer>) {
+					for await (const chunk of chunks) {
+						resetIdleTimer();
+						downloadedBytes += chunk.length;
+						if (Number.isFinite(totalBytes) && totalBytes > 0) {
+							const progress = Math.min(
+								100,
+								Math.round((downloadedBytes / totalBytes) * 100),
+							);
+							if (progress !== lastProgress) {
+								lastProgress = progress;
+								onProgress(progress);
+							}
 						}
+						yield chunk;
 					}
-					yield chunk;
-				}
-			},
-			createWriteStream(destinationPath),
-		);
-		if (lastProgress !== 100) {
-			onProgress(100);
-		}
-	} catch (error) {
-		if (timedOut) {
-			throw new Error("Whisper model download timed out.");
-		}
-		throw error;
-	} finally {
-		clearTimeout(idleTimer);
-	}
+				},
+				createWriteStream(destinationPath),
+			).then(
+				() => {
+					if (lastProgress !== 100) {
+						onProgress(100);
+					}
+					finish();
+				},
+				(error: Error) => finish(error),
+			);
+		});
+
+		resetIdleTimer();
+		request.end();
+	});
 }
 
 export async function downloadWhisperSmallModel(
