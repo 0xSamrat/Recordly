@@ -1,8 +1,11 @@
 import { createWriteStream } from "node:fs";
 import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
-import { get as httpsGet } from "node:https";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import type { ReadableStream as NodeReadableStream } from "node:stream/web";
 import type Electron from "electron";
+import { session } from "electron";
 import {
 	WHISPER_MODEL_DIR,
 	WHISPER_MODEL_DOWNLOAD_URL,
@@ -38,76 +41,102 @@ export async function getWhisperSmallModelStatus() {
 	}
 }
 
-export function downloadFileWithProgress(
+const DOWNLOAD_IDLE_TIMEOUT_MS = 30_000;
+const PROXY_ENV_KEYS = [
+	"HTTPS_PROXY",
+	"https_proxy",
+	"HTTP_PROXY",
+	"http_proxy",
+	"ALL_PROXY",
+	"all_proxy",
+];
+
+/** Reads the proxy the user configured through the usual environment variables. */
+export function getProxyConfigFromEnv(
+	env: NodeJS.ProcessEnv = process.env,
+): Electron.ProxyConfig | null {
+	const proxyRules = PROXY_ENV_KEYS.map((key) => env[key]?.trim()).find(Boolean);
+	if (!proxyRules) {
+		return null;
+	}
+
+	const proxyBypassRules = (env.NO_PROXY ?? env.no_proxy)?.trim();
+	return proxyBypassRules ? { proxyRules, proxyBypassRules } : { proxyRules };
+}
+
+// Electron's network stack follows the system proxy settings (unlike node:https).
+// A proxy set through environment variables wins, as it does for curl and wget.
+async function getDownloadSession(): Promise<Electron.Session> {
+	const proxyConfig = getProxyConfigFromEnv();
+	if (!proxyConfig) {
+		return session.defaultSession;
+	}
+
+	const downloadSession = session.fromPartition("recordly-downloads");
+	await downloadSession.setProxy(proxyConfig);
+	return downloadSession;
+}
+
+export async function downloadFileWithProgress(
 	url: string,
 	destinationPath: string,
 	onProgress: (progress: number) => void,
 ): Promise<void> {
-	const request = (currentUrl: string, redirectCount = 0): Promise<void> => {
-		return new Promise((resolve, reject) => {
-			const req = httpsGet(currentUrl, { timeout: 30_000 }, (response) => {
-				const statusCode = response.statusCode ?? 0;
-				const location = response.headers.location;
-
-				if (statusCode >= 300 && statusCode < 400 && location) {
-					response.resume();
-					if (redirectCount >= 5) {
-						reject(new Error("Too many redirects while downloading Whisper model."));
-						return;
-					}
-
-					const nextUrl = new URL(location, currentUrl).toString();
-					void request(nextUrl, redirectCount + 1)
-						.then(resolve)
-						.catch(reject);
-					return;
-				}
-
-				if (statusCode < 200 || statusCode >= 300) {
-					response.resume();
-					reject(new Error(`Whisper model download failed with status ${statusCode}.`));
-					return;
-				}
-
-				const totalBytes = Number.parseInt(
-					String(response.headers["content-length"] ?? "0"),
-					10,
-				);
-				let downloadedBytes = 0;
-				const fileStream = createWriteStream(destinationPath);
-
-				response.on("data", (chunk: Buffer) => {
-					downloadedBytes += chunk.length;
-					if (Number.isFinite(totalBytes) && totalBytes > 0) {
-						onProgress(Math.min(100, Math.round((downloadedBytes / totalBytes) * 100)));
-					}
-				});
-
-				response.on("error", (error) => {
-					fileStream.destroy(error);
-				});
-
-				fileStream.on("error", (error) => {
-					response.destroy(error);
-					reject(error);
-				});
-
-				fileStream.on("finish", () => {
-					onProgress(100);
-					resolve();
-				});
-
-				response.pipe(fileStream);
-			});
-
-			req.on("error", reject);
-			req.on("timeout", () => {
-				req.destroy(new Error("Whisper model download timed out."));
-			});
-		});
+	const downloadSession = await getDownloadSession();
+	const controller = new AbortController();
+	let timedOut = false;
+	let idleTimer: NodeJS.Timeout | undefined;
+	const resetIdleTimer = () => {
+		clearTimeout(idleTimer);
+		idleTimer = setTimeout(() => {
+			timedOut = true;
+			controller.abort();
+		}, DOWNLOAD_IDLE_TIMEOUT_MS);
 	};
 
-	return request(url);
+	resetIdleTimer();
+	try {
+		const response = await downloadSession.fetch(url, { signal: controller.signal });
+		if (!response.ok || !response.body) {
+			throw new Error(`Whisper model download failed with status ${response.status}.`);
+		}
+
+		const totalBytes = Number.parseInt(response.headers.get("content-length") ?? "0", 10);
+		let downloadedBytes = 0;
+		let lastProgress = -1;
+
+		await pipeline(
+			Readable.fromWeb(response.body as NodeReadableStream<Uint8Array>),
+			async function* (chunks: AsyncIterable<Buffer>) {
+				for await (const chunk of chunks) {
+					resetIdleTimer();
+					downloadedBytes += chunk.length;
+					if (Number.isFinite(totalBytes) && totalBytes > 0) {
+						const progress = Math.min(
+							100,
+							Math.round((downloadedBytes / totalBytes) * 100),
+						);
+						if (progress !== lastProgress) {
+							lastProgress = progress;
+							onProgress(progress);
+						}
+					}
+					yield chunk;
+				}
+			},
+			createWriteStream(destinationPath),
+		);
+		if (lastProgress !== 100) {
+			onProgress(100);
+		}
+	} catch (error) {
+		if (timedOut) {
+			throw new Error("Whisper model download timed out.");
+		}
+		throw error;
+	} finally {
+		clearTimeout(idleTimer);
+	}
 }
 
 export async function downloadWhisperSmallModel(
