@@ -59,6 +59,15 @@ describe.skipIf(process.platform === "win32")("bundled FFmpeg checks", () => {
 		expect(getBinaryRunProblem(path.join(tempRoot, "missing-ffmpeg"))).toBe("ENOENT");
 	});
 
+	it("stops waiting for a binary that hangs, even if it ignores SIGTERM", async () => {
+		const hanging = await writeScript("hanging-ffmpeg", "trap '' TERM\nsleep 30", 0o755);
+		const { getBinaryRunProblem } = await importBinaryModule();
+
+		const startedAt = Date.now();
+		expect(getBinaryRunProblem(hanging)).toBe("ETIMEDOUT");
+		expect(Date.now() - startedAt).toBeLessThan(10_000);
+	}, 15_000);
+
 	it("checks each binary only once", async () => {
 		const binaryPath = await writeScript("ffmpeg", "exit 0", 0o755);
 		const { getBinaryRunProblem } = await importBinaryModule();

@@ -6,11 +6,14 @@ import { app } from "electron";
 const nodeRequire = createRequire(import.meta.url);
 
 const binaryRunProblems = new Map<string, string | null>();
+const BINARY_RUN_CHECK_TIMEOUT_MS = 5_000;
 
 /**
  * Returns why the binary at `binaryPath` cannot run, or null when it runs.
  * A bundled binary can exist but still fail to start (missing execute bit,
  * noexec mount, wrong architecture), so we run `-version` once and cache it.
+ * The check is synchronous like the rest of the lookup; SIGKILL on timeout
+ * bounds how long a hung binary can block it.
  */
 export function getBinaryRunProblem(binaryPath: string): string | null {
 	const cached = binaryRunProblems.get(binaryPath);
@@ -20,7 +23,8 @@ export function getBinaryRunProblem(binaryPath: string): string | null {
 
 	const result = spawnSync(binaryPath, ["-version"], {
 		stdio: "ignore",
-		timeout: 10_000,
+		timeout: BINARY_RUN_CHECK_TIMEOUT_MS,
+		killSignal: "SIGKILL",
 		windowsHide: true,
 	});
 
